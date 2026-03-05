@@ -220,3 +220,231 @@ def get_users():
         "limit": limit,
         "total_pages": total_pages
     })
+
+@bp.route("/api/users", methods=["POST"])
+def create_customer():
+    data = request.json
+    first_name = data.get("first_name")
+    last_name = data.get("last_name")
+    email = data.get("email")
+    active = data.get("active", 1)
+
+    if not first_name or not last_name:
+        return jsonify({"error": "First name and last name are required"}), 400
+
+    insert_sql = text("""
+        INSERT INTO customer 
+        (store_id, first_name, last_name, email, address_id, active, create_date)
+    VALUES
+        (:store_id, :first_name, :last_name, :email, :address_id, :active, NOW())
+    """)
+    try:
+        db.session.execute(insert_sql, {
+            "store_id": 1,
+            "address_id": 1, 
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": email,
+            "active": active
+        })
+        db.session.commit()
+        return jsonify({"message": "Customer added successfully"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/api/users/<int:customer_id>", methods=["PUT"])
+def update_customer(customer_id):
+    data = request.json
+    first_name = data.get("first_name")
+    last_name = data.get("last_name")
+    email = data.get("email")
+    active = data.get("active")
+
+    
+    check_sql = text("SELECT customer_id FROM customer WHERE customer_id = :customer_id")
+    customer = db.session.execute(check_sql, {"customer_id": customer_id}).mappings().first()
+    if not customer:
+        return jsonify({"error": "Customer not found"}), 404
+
+    update_sql = text("""
+        UPDATE customer
+        SET first_name = :first_name,
+            last_name = :last_name,
+            email = :email,
+            active = :active
+        WHERE customer_id = :customer_id
+    """)
+    try:
+        db.session.execute(update_sql, {
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": email,
+            "active": active,
+            "customer_id": customer_id
+        })
+        db.session.commit()
+        return jsonify({"message": "Customer updated successfully"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/api/users/<int:customer_id>", methods=["DELETE"])
+def delete_customer(customer_id):
+    
+    check_sql = text("SELECT customer_id FROM customer WHERE customer_id = :customer_id")
+    customer = db.session.execute(check_sql, {"customer_id": customer_id}).mappings().first()
+    if not customer:
+        return jsonify({"error": "Customer not found"}), 404
+
+    delete_sql = text("DELETE FROM customer WHERE customer_id = :customer_id")
+    try:
+        db.session.execute(delete_sql, {"customer_id": customer_id})
+        db.session.commit()
+        return jsonify({"message": "Customer deleted successfully"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    
+
+@bp.route("/api/users/<int:customer_id>/rentals", methods=["GET"])
+def get_customer_rentals(customer_id):
+    page = int(request.args.get("page", 1))
+    limit = int(request.args.get("limit", 5))
+    offset = (page - 1) * limit
+
+    # Validate customer
+    customer_query = text("SELECT * FROM customer WHERE customer_id = :customer_id")
+    customer = db.session.execute(customer_query, {"customer_id": customer_id}).mappings().first()
+    if not customer:
+        return jsonify({"error": "Customer not found"}), 404
+
+    # Get rentals
+    rentals_query = text("""
+        SELECT r.rental_id, f.title, r.rental_date, r.return_date
+        FROM rental r
+        JOIN inventory i ON r.inventory_id = i.inventory_id
+        JOIN film f ON i.film_id = f.film_id
+        WHERE r.customer_id = :customer_id
+        ORDER BY r.rental_date DESC
+        LIMIT :limit OFFSET :offset
+    """)
+    rentals = db.session.execute(rentals_query, {
+        "customer_id": customer_id,
+        "limit": limit,
+        "offset": offset
+    }).mappings().all()
+
+    # Total rentals for pagination
+    count_query = text("SELECT COUNT(*) FROM rental WHERE customer_id = :customer_id")
+    total = db.session.execute(count_query, {"customer_id": customer_id}).scalar_one()
+    total_pages = (total + limit - 1) // limit
+
+    return jsonify({
+        "customer": dict(customer),
+        "rentals": [dict(r) for r in rentals],
+        "page": page,
+        "total_pages": total_pages
+    })
+
+@bp.route("/api/rent", methods=["POST"])
+def rent_film():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON request"}), 400
+
+    film_id = data.get("film_id")
+    customer_id = data.get("customer_id")
+    if not film_id or not customer_id:
+        return jsonify({"error": "film_id and customer_id are required"}), 400
+
+    # Validate customer
+    customer_query = text("""
+        SELECT customer_id, active
+        FROM customer
+        WHERE customer_id = :customer_id
+    """)
+    customer = db.session.execute(customer_query, {"customer_id": customer_id}).mappings().first()
+    if not customer:
+        return jsonify({"error": "Customer does not exist"}), 404
+    if customer["active"] == 0:
+        return jsonify({"error": "Customer account is inactive"}), 403
+
+    # Find available inventory
+    inventory_query = text("""
+        SELECT i.inventory_id
+        FROM inventory i
+        LEFT JOIN rental r
+            ON i.inventory_id = r.inventory_id
+            AND r.return_date IS NULL
+        WHERE i.film_id = :film_id
+        AND r.rental_id IS NULL
+        LIMIT 1
+    """)
+    inventory = db.session.execute(inventory_query, {"film_id": film_id}).mappings().first()
+    if not inventory:
+        return jsonify({"error": "No available copies of this film"}), 400
+
+    inventory_id = inventory["inventory_id"]
+
+    # Staff ID (example)
+    staff_id = 1
+
+    rental_query = text("""
+        INSERT INTO rental (rental_date, inventory_id, customer_id, staff_id)
+        VALUES (NOW(), :inventory_id, :customer_id, :staff_id)
+    """)
+    try:
+        db.session.execute(rental_query, {
+            "inventory_id": inventory_id,
+            "customer_id": customer_id,
+            "staff_id": staff_id
+        })
+        db.session.commit()
+        return jsonify({
+            "message": "Film rented successfully",
+            "film_id": film_id,
+            "inventory_id": inventory_id,
+            "customer_id": customer_id
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
+
+@bp.route("/api/return", methods=["POST"])
+def return_film():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON request"}), 400
+
+    rental_id = data.get("rental_id")
+    if not rental_id:
+        return jsonify({"error": "rental_id is required"}), 400
+
+    # Check if the rental exists and is not already returned
+    rental_query = text("""
+        SELECT rental_id, return_date
+        FROM rental
+        WHERE rental_id = :rental_id
+    """)
+    rental = db.session.execute(rental_query, {"rental_id": rental_id}).mappings().first()
+    if not rental:
+        return jsonify({"error": "Rental not found"}), 404
+    if rental["return_date"] is not None:
+        return jsonify({"error": "This film has already been returned"}), 400
+
+    # Update rental to mark as returned
+    update_query = text("""
+        UPDATE rental
+        SET return_date = NOW()
+        WHERE rental_id = :rental_id
+    """)
+    try:
+        db.session.execute(update_query, {"rental_id": rental_id})
+        db.session.commit()
+        return jsonify({"message": "Film returned successfully", "rental_id": rental_id})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
